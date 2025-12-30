@@ -1,0 +1,90 @@
+  !pip install cupy-cuda12x
+import cupy as cp
+import numpy as np
+import os
+coords_cpu = np.array([d[0] for d in dd], dtype=np.float64)
+thetas_cpu = np.array([d[1] for d in dd], dtype=np.float64)
+coords = cp.array(coords_cpu)
+thetas = cp.array(thetas_cpu)
+input_img = cp.zeros((10,10,1000), dtype=cp.float64)
+input_img[4:6,4:6,100:900] = 10
+img = cp.ones((10,10,1000), dtype=cp.float64)
+tmp = cp.zeros((10,10,1000), dtype=cp.float64)
+
+image_matrix_size_mm = cp.array([10,10,1000], dtype=cp.float64)
+voxel_size_mm = cp.array([1,1,1], dtype=cp.float64)
+voxel_nb = cp.rint(image_matrix_size_mm / voxel_size_mm).astype(cp.int32)
+
+def safe_division(a, b):
+    epsilon = 1e-6
+    return cp.where(cp.abs(b) > epsilon, a / (b + epsilon),
+                    cp.where(a != 0, cp.inf, 0.0))
+
+def probability_gpu(P1, P2):
+    Xplanes = cp.linspace(-image_matrix_size_mm[0]/2, image_matrix_size_mm[0]/2, voxel_nb[0]+1)
+    Yplanes = cp.linspace(-image_matrix_size_mm[1]/2, image_matrix_size_mm[1]/2, voxel_nb[1]+1)
+    Zplanes = cp.linspace(-image_matrix_size_mm[2]/2, image_matrix_size_mm[2]/2, voxel_nb[2]+1)
+
+    alphaX = safe_division(Xplanes - P1[0], P2[0] - P1[0])
+    alphaY = safe_division(Yplanes - P1[1], P2[1] - P1[1])
+    alphaZ = safe_division(Zplanes - P1[2], P2[2] - P1[2])
+
+    alphaMin = cp.maximum(0.0, cp.minimum(alphaX[0], alphaX[-1]),
+                          cp.minimum(alphaY[0], alphaY[-1]),
+                          cp.minimum(alphaZ[0], alphaZ[-1]))
+    alphaMax = cp.minimum(1.0, cp.maximum(alphaX[0], alphaX[-1]),
+                          cp.maximum(alphaY[0], alphaY[-1]),
+                          cp.maximum(alphaZ[0], alphaZ[-1]))
+
+    if alphaMax <= alphaMin:
+        return cp.zeros((0,4), dtype=cp.float64)
+
+    alpha = cp.unique(cp.concatenate(([alphaMin], alphaX, alphaY, alphaZ, [alphaMax])))
+    alpha = cp.sort(alpha[(alpha >= alphaMin) & (alpha <= alphaMax)])
+
+    d12 = cp.linalg.norm(P1 - P2)
+    alphamid = 0.5*(alpha[:-1] + alpha[1:])
+    n = alphamid.size
+
+    TOR = cp.zeros((n,4), dtype=cp.float64)
+
+    probs = d12 * (alpha[1:] - alpha[:-1])
+    sum_probs = cp.sum(probs)
+    if sum_probs > 0:
+        probs /= sum_probs
+    TOR[:,3] = probs
+
+    TOR[:,0] = cp.floor((P1[0] + alphamid*(P2[0]-P1[0]) - Xplanes[0])/voxel_size_mm[0])
+    TOR[:,1] = cp.floor((P1[1] + alphamid*(P2[1]-P1[1]) - Yplanes[0])/voxel_size_mm[1])
+    TOR[:,2] = cp.floor((P1[2] + alphamid*(P2[2]-P1[2]) - Zplanes[0])/voxel_size_mm[2])
+
+    return TOR
+
+N = coords.shape[0]
+
+for pp in range(N-1):
+    P1 = coords[pp]
+    theta1 = thetas[pp]
+
+    # Vectorized theta filter to reduce LOR count
+    mask_tt = cp.where((cp.abs(thetas[pp+1:] - theta1) > 178) & (cp.abs(thetas[pp+1:] - theta1) < 182))[0]
+
+    for offset, tt in enumerate(mask_tt):
+        tt_idx = pp + 1 + tt
+        P2 = coords[tt_idx]
+        TOR = probability_gpu(P1, P2)
+        if TOR.shape[0] == 0:
+            continue
+
+        # Compute proj and proj0 with broadcasting
+        x = TOR[:,0].astype(cp.int32)
+        y = TOR[:,1].astype(cp.int32)
+        z = TOR[:,2].astype(cp.int32)
+        p = TOR[:,3]
+
+        proj = cp.sum(img[x,y,z] * p)
+        proj0 = cp.sum(input_img[x,y,z] * p)
+
+        if proj != 0.0 and proj0 != 0.0:
+            tmp[x,y,z] += p*(proj0/proj)
+cp.save('tmp_gpu.npy', tmp)
